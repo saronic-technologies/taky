@@ -2,6 +2,7 @@
 import os
 import time
 import enum
+from collections import deque
 from datetime import datetime as dt
 from datetime import timedelta
 import socket
@@ -36,7 +37,7 @@ class SocketClient:
         self.ssl = use_ssl
         self.peer_cert = None
         self.ssl_hs = SSLState.SSL_WAIT if use_ssl else SSLState.NO_SSL
-        self.out_buff = b""
+        self.out_buff = deque()
         self.connect_cb = kwargs.get("cbs", {}).get("connect", lambda client: None)
 
         (ip, port) = self.addr
@@ -140,9 +141,16 @@ class SocketClient:
             self.ssl_handshake()
             return
 
+        if not self.out_buff:
+            return
+
         try:
-            sent = self.sock.send(self.out_buff[0:4096])
-            self.out_buff = self.out_buff[sent:]
+            data = memoryview(self.out_buff[0])
+            sent = self.sock.send(data[:4096])
+            if sent == len(data):
+                self.out_buff.popleft()
+            else:
+                self.out_buff[0] = data[sent:]
         except BlockingIOError:
             self.lgr.debug("Client blocked TX: %s", self)
         except (ssl.SSLError, socket.error, IOError, OSError) as exc:
@@ -391,4 +399,4 @@ class SocketTAKClient(TAKClient, SocketClient):
         if not self.ready:
             return
 
-        self.out_buff += etree.tostring(event.as_element)
+        self.out_buff.append(etree.tostring(event.as_element))

@@ -52,7 +52,7 @@ class MgmtClient(SocketClient):
             ret = {"error": str(exc)}
 
         ret = json.dumps(ret)
-        self.out_buff += ret.encode() + b"\0"
+        self.out_buff.append(ret.encode() + b"\0")
 
     def kickban(self, user):
         cdb = self.server.cert_db
