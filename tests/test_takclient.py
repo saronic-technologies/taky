@@ -6,9 +6,18 @@ from lxml import etree
 
 from taky import cot
 from taky.config import load_config, app_config
+from taky.cot.client import OutputBuffer
 from taky.cot import models
 
 from .test_cot_event import XML_S
+
+
+class OutputBufferTest(ut.TestCase):
+    def test_rejects_mutable_data(self):
+        output_buffer = OutputBuffer()
+
+        with self.assertRaises(TypeError):
+            output_buffer.append(bytearray(b"mutable"))
 
 
 class TAKClientTest(ut.TestCase):
@@ -87,6 +96,36 @@ class SocketTAKClientTest(ut.TestCase):
         self.assertEqual(offered[0], expected[:4096])
         self.assertTrue(all(len(data) <= 4096 for data in offered))
 
+    def test_socket_tx_batches_events_with_partial_write_across_boundaries(self):
+        self.tk.out_buff.append(b"abc")
+        self.tk.out_buff.append(b"defg")
+
+        transmitted = bytearray()
+        offered = []
+        send_sizes = iter([5, 5])
+
+        def send(data):
+            data = bytes(data)
+            offered.append(data)
+            sent = min(next(send_sizes), len(data))
+            transmitted.extend(data[:sent])
+            return sent
+
+        self.sock.send.side_effect = send
+
+        self.tk.socket_tx()
+
+        self.assertEqual(offered, [b"abcdefg"])
+        self.assertEqual(bytes(transmitted), b"abcde")
+        self.assertTrue(self.tk.has_data)
+
+        self.tk.out_buff.append(b"hij")
+        self.tk.socket_tx()
+
+        self.assertEqual(offered, [b"abcdefg", b"fghij"])
+        self.assertEqual(bytes(transmitted), b"abcdefghij")
+        self.assertFalse(self.tk.has_data)
+
     def test_socket_tx_preserves_event_when_write_blocks(self):
         event = models.Event.from_elm(etree.fromstring(XML_S))
         expected = etree.tostring(event.as_element)
@@ -109,6 +148,15 @@ class SocketTAKClientTest(ut.TestCase):
 
         self.assertEqual(bytes(transmitted), expected)
         self.assertFalse(self.tk.has_data)
+
+    def test_socket_tx_disconnects_when_send_makes_no_progress(self):
+        self.tk.out_buff.append(b"data")
+        self.sock.send.return_value = 0
+        self.tk.disconnect = mock.Mock()
+
+        self.tk.socket_tx()
+
+        self.tk.disconnect.assert_called_once()
 
     def tearDown(self):
         self.mock_sock.stop()

@@ -5,6 +5,7 @@ import enum
 from collections import deque
 from datetime import datetime as dt
 from datetime import timedelta
+from itertools import islice
 import socket
 import ssl
 import logging
@@ -15,6 +16,80 @@ from lxml import etree
 from taky.config import app_config
 from taky.util import XMLDeclStrip
 from . import models
+
+
+class OutputBuffer:
+    """Buffers immutable bytes for non-blocking socket writes."""
+
+    def __init__(self):
+        self._chunks = deque()
+        self._head_offset = 0
+        self._size = 0
+
+    def __bool__(self):
+        return self._size > 0
+
+    def __len__(self):
+        return self._size
+
+    def append(self, data):
+        """Append immutable bytes to the buffer."""
+        if not isinstance(data, bytes):
+            raise TypeError("OutputBuffer accepts bytes")
+
+        if data:
+            self._chunks.append(data)
+            self._size += len(data)
+
+    def send(self, sock, max_bytes=4096):
+        """Send queued bytes once and remove the bytes written."""
+        data = self._peek(max_bytes)
+        if not data:
+            return 0
+
+        sent = sock.send(data)
+        if sent == 0:
+            raise ConnectionError("Socket send made no progress")
+
+        self._remove(sent)
+        return sent
+
+    def _peek(self, max_bytes):
+        if max_bytes <= 0:
+            raise ValueError("max_bytes must be positive")
+
+        if not self._chunks:
+            return b""
+
+        head = memoryview(self._chunks[0])[self._head_offset :]
+        if len(head) >= max_bytes or len(self._chunks) == 1:
+            return head[:max_bytes]
+
+        parts = [head]
+        remaining = max_bytes - len(head)
+        for chunk in islice(self._chunks, 1, None):
+            part = memoryview(chunk)[:remaining]
+            parts.append(part)
+            remaining -= len(part)
+            if remaining == 0:
+                break
+
+        return b"".join(parts)
+
+    def _remove(self, count):
+        if count < 0 or count > self._size:
+            raise ValueError("Cannot remove beyond buffered data")
+
+        self._size -= count
+        while count:
+            available = len(self._chunks[0]) - self._head_offset
+            if count < available:
+                self._head_offset += count
+                return
+
+            count -= available
+            self._chunks.popleft()
+            self._head_offset = 0
 
 
 class SSLState(enum.Enum):
@@ -37,7 +112,7 @@ class SocketClient:
         self.ssl = use_ssl
         self.peer_cert = None
         self.ssl_hs = SSLState.SSL_WAIT if use_ssl else SSLState.NO_SSL
-        self.out_buff = deque()
+        self.out_buff = OutputBuffer()
         self.connect_cb = kwargs.get("cbs", {}).get("connect", lambda client: None)
 
         (ip, port) = self.addr
@@ -145,12 +220,7 @@ class SocketClient:
             return
 
         try:
-            data = memoryview(self.out_buff[0])
-            sent = self.sock.send(data[:4096])
-            if sent == len(data):
-                self.out_buff.popleft()
-            else:
-                self.out_buff[0] = data[sent:]
+            self.out_buff.send(self.sock)
         except BlockingIOError:
             self.lgr.debug("Client blocked TX: %s", self)
         except (ssl.SSLError, socket.error, IOError, OSError) as exc:
