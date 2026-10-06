@@ -7,7 +7,7 @@ from datetime import timedelta
 
 from taky.config import app_config
 from . import models
-from .client import TAKClient
+from .client import TAKClient, SocketTAKClient
 from .persistence import build_persistence
 
 
@@ -57,6 +57,9 @@ class COTRouter:
         Called by TAKClient when the client first identifies to the server
         """
         self.lgr.debug("Sending persistence objects to %s", client)
+        if isinstance(client, SocketTAKClient):
+            client.start_replay(self.persist)
+            return
         for event in self.persist.get_all():
             if client.user and event.uid == client.user.uid:
                 continue

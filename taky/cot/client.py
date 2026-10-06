@@ -2,10 +2,9 @@
 import os
 import time
 import enum
-from collections import deque
+from collections import OrderedDict
 from datetime import datetime as dt
 from datetime import timedelta
-from itertools import islice
 import socket
 import ssl
 import logging
@@ -16,80 +15,63 @@ from lxml import etree
 from taky.config import app_config
 from taky.util import XMLDeclStrip
 from . import models
+from .output import OutputBuffer
 
 
-class OutputBuffer:
-    """Buffers immutable bytes for non-blocking socket writes."""
+class OutputBudget:
+    """Limits retained output payloads across the server's socket clients."""
 
-    def __init__(self):
-        self._chunks = deque()
-        self._head_offset = 0
-        self._size = 0
+    def __init__(self, limit):
+        self.limit = limit
+        self.clients = set()
+        self._retained_bytes = 0
 
-    def __bool__(self):
-        return self._size > 0
+    @property
+    def retained_bytes(self):
+        return self._retained_bytes
 
-    def __len__(self):
-        return self._size
+    def adjust_retained_bytes(self, delta):
+        """Account for backing storage added or released by an output buffer."""
+        self._retained_bytes += delta
 
-    def append(self, data):
-        """Append immutable bytes to the buffer."""
-        if not isinstance(data, bytes):
-            raise TypeError("OutputBuffer accepts bytes")
+    def make_room(self, client, size):
+        if size > self.limit:
+            client.disconnect("Event exceeds total output byte limit")
+            return False
+        while self.retained_bytes + size > self.limit:
+            victim = max(self.clients, key=lambda item: item.out_buff.retained_bytes)
+            victim.disconnect("Total output byte limit exceeded")
+            if victim is client:
+                return False
+        return True
 
-        if data:
-            self._chunks.append(data)
-            self._size += len(data)
 
-    def send(self, sock, max_bytes=4096):
-        """Send queued bytes once and remove the bytes written."""
-        data = self._peek(max_bytes)
-        if not data:
-            return 0
+POSITION_DETAIL_TAGS = {
+    "takv",
+    "contact",
+    "uid",
+    "precisionlocation",
+    "__group",
+    "status",
+    "track",
+}
 
-        sent = sock.send(data)
-        if sent == 0:
-            raise ConnectionError("Socket send made no progress")
 
-        self._remove(sent)
-        return sent
-
-    def _peek(self, max_bytes):
-        if max_bytes <= 0:
-            raise ValueError("max_bytes must be positive")
-
-        if not self._chunks:
-            return b""
-
-        head = memoryview(self._chunks[0])[self._head_offset :]
-        if len(head) >= max_bytes or len(self._chunks) == 1:
-            return head[:max_bytes]
-
-        parts = [head]
-        remaining = max_bytes - len(head)
-        for chunk in islice(self._chunks, 1, None):
-            part = memoryview(chunk)[:remaining]
-            parts.append(part)
-            remaining -= len(part)
-            if remaining == 0:
-                break
-
-        return b"".join(parts)
-
-    def _remove(self, count):
-        if count < 0 or count > self._size:
-            raise ValueError("Cannot remove beyond buffered data")
-
-        self._size -= count
-        while count:
-            available = len(self._chunks[0]) - self._head_offset
-            if count < available:
-                self._head_offset += count
-                return
-
-            count -= available
-            self._chunks.popleft()
-            self._head_offset = 0
+def position_key(event):
+    """Recognize ordinary participant updates without command extensions."""
+    if (
+        event.uid
+        and event.etype
+        and event.etype.startswith("a-")
+        and isinstance(event.detail, models.TAKUser)
+        and event.detail.elm is not None
+        and all(
+            child.tag in POSITION_DETAIL_TAGS and len(child) == 0
+            for child in event.detail.elm
+        )
+    ):
+        return (event.uid, event.etype)
+    return None
 
 
 class SSLState(enum.Enum):
@@ -112,10 +94,28 @@ class SocketClient:
         self.ssl = use_ssl
         self.peer_cert = None
         self.ssl_hs = SSLState.SSL_WAIT if use_ssl else SSLState.NO_SSL
-        self.out_buff = OutputBuffer()
+        self.output_limit = app_config.getint(
+            "cot_server", "output_client_bytes", fallback=4 * 1024 * 1024
+        )
+        self.output_stall_seconds = app_config.getint(
+            "cot_server", "output_stall_seconds", fallback=60
+        )
+        self.output_budget = kwargs.get("output_budget")
+        if self.output_budget is None:
+            self.output_budget = OutputBudget(
+                app_config.getint(
+                    "cot_server", "output_total_bytes", fallback=64 * 1024 * 1024
+                )
+            )
+        self.out_buff = OutputBuffer(
+            retained_change=self.output_budget.adjust_retained_bytes
+        )
+        self.output_budget.clients.add(self)
+        self._closed = False
+        self._rx_wait_write = False
         self.connect_cb = kwargs.get("cbs", {}).get("connect", lambda client: None)
 
-        (ip, port) = self.addr
+        ip, port = self.addr
         lgr_name = f"{self.__class__.__name__}@{ip}:{port}"
         self.lgr = logging.getLogger(lgr_name)
 
@@ -142,17 +142,57 @@ class SocketClient:
     @property
     def is_closed(self):
         """Returns true if the socket is closed"""
-        return self.sock.fileno() == -1
+        return self._closed or self.sock.fileno() == -1
 
     @property
     def has_data(self):
         """
         Returns true if the socket wants to be considered for transmitting
         """
-        return len(self.out_buff) > 0 or self.ssl_hs == SSLState.SSL_WAIT_TX
+        return (
+            (bool(self.out_buff) and self.out_buff.write_wait != "read")
+            or self.ssl_hs == SSLState.SSL_WAIT_TX
+            or self._rx_wait_write
+        )
+
+    @property
+    def wants_read(self):
+        return not self._rx_wait_write and self.out_buff.write_wait != "write"
+
+    @property
+    def output_stalled_seconds(self):
+        if not self.out_buff or self.out_buff.progress_at is None:
+            return 0
+        return max(0, time.monotonic() - self.out_buff.progress_at)
+
+    def enqueue(self, data, key=None, timestamp=None, replay=False):
+        """Queue bytes, replacing only recognized, entirely unsent updates."""
+        if self.is_closed:
+            return False
+        if not self.out_buff.remove_superseded(key, timestamp):
+            return False
+        if self.out_buff.retained_bytes + len(data) > self.output_limit:
+            if not replay:
+                self.disconnect("Client output byte limit exceeded")
+            return False
+        if replay:
+            if self.output_budget.retained_bytes + len(data) > self.output_budget.limit:
+                return False
+        elif not self.output_budget.make_room(self, len(data)):
+            return False
+        self.out_buff.append(data, key=key, timestamp=timestamp)
+        return True
+
+    def check_output_timeout(self, now=None):
+        if not self.out_buff or self.out_buff.progress_at is None:
+            return
+        if now is None:
+            now = time.monotonic()
+        if now - self.out_buff.progress_at >= self.output_stall_seconds:
+            self.disconnect("Output made no progress before timeout")
 
     def __repr__(self):
-        (ip, port) = self.addr[0:2]
+        ip, port = self.addr[0:2]
         return f"<{self.__class__.__name__} addr={ip}:{port} ssl={self.ssl}>"
 
     def feed(self, data):
@@ -188,8 +228,13 @@ class SocketClient:
             self.ssl_handshake()
             return
 
+        if self.out_buff.write_wait == "read":
+            self.socket_tx()
+            return
+
         try:
             data = self.sock.recv(4096)
+            self._rx_wait_write = False
 
             if len(data) == 0:
                 self.disconnect("Client disconnected")
@@ -199,6 +244,10 @@ class SocketClient:
         except etree.XMLSyntaxError as exc:
             self.disconnect("XML Syntax Error")
             self.lgr.debug("XML Syntax Error: %s", self, exc_info=exc)
+        except ssl.SSLWantReadError:
+            self._rx_wait_write = False
+        except ssl.SSLWantWriteError:
+            self._rx_wait_write = True
         except BlockingIOError:
             self.lgr.debug("Client blocked RX: %s", self)
         except (ssl.SSLError, socket.error, IOError, OSError) as exc:
@@ -216,19 +265,36 @@ class SocketClient:
             self.ssl_handshake()
             return
 
+        if self._rx_wait_write:
+            self.socket_rx()
+            return
         if not self.out_buff:
             return
 
         try:
             self.out_buff.send(self.sock)
+        except (ssl.SSLWantReadError, ssl.SSLWantWriteError):
+            pass
         except BlockingIOError:
             self.lgr.debug("Client blocked TX: %s", self)
         except (ssl.SSLError, socket.error, IOError, OSError) as exc:
             self.disconnect(str(exc))
 
     def disconnect(self, reason=None):
-        if not self.is_closed:
-            self.lgr.info("Socket disconnect: %s", reason)
+        if self._closed:
+            return
+        self.lgr.info(
+            "Socket disconnect: %s (pending=%d retained=%d stalled=%.1fs)",
+            reason,
+            len(self.out_buff),
+            self.out_buff.retained_bytes,
+            self.output_stalled_seconds,
+        )
+        self._closed = True
+        self.out_buff.clear()
+        self.output_budget.clients.discard(self)
+        self._rx_wait_write = False
+        self.close()
 
         try:
             self.sock.shutdown(socket.SHUT_RDWR)
@@ -236,6 +302,9 @@ class SocketClient:
             pass
         finally:
             self.sock.close()
+
+    def close(self):
+        """Release subclass state when the socket closes."""
 
 
 class TAKClient:
@@ -350,7 +419,7 @@ class TAKClient:
             self.cot_fp.flush()
         except (IOError, OSError) as exc:
             self.lgr.warning("Unable to write to COT log: %s", exc)
-            self.close()
+            self.close_cot()
             self.log_cot_dir = None
 
     def feed(self, data):
@@ -360,7 +429,7 @@ class TAKClient:
         # TODO: Specify maximum element size
         self.xdc.feed(data)
 
-        for (_, elm) in self.xdc.read_events():
+        for _, elm in self.xdc.read_events():
             self.num_rx += 1
             self.last_rx = time.time()
             try:
@@ -440,6 +509,8 @@ class SocketTAKClient(TAKClient, SocketClient):
 
     def __init__(self, **kwargs):
         TAKClient.__init__(self, **kwargs)
+        self.replay_pending = OrderedDict()
+        self.replay_store = None
         SocketClient.__init__(self, **kwargs)
 
     def __repr__(self):
@@ -465,8 +536,45 @@ class SocketTAKClient(TAKClient, SocketClient):
         if not isinstance(event, models.Event):
             raise TypeError("Must send a COTEvent")
 
-        # Silently drop data if the SSL handshake is not ready yet
-        if not self.ready:
+        if not self.ready or self.is_closed:
+            return False
+
+        # A live update supersedes the saved event still waiting for replay.
+        self.replay_pending.pop(event.uid, None)
+        return self.enqueue(
+            etree.tostring(event.as_element), position_key(event), event.time
+        )
+
+    def start_replay(self, persistence):
+        self.replay_store = persistence
+        self.replay_pending = OrderedDict.fromkeys(persistence.get_uids())
+        self.pump_replay()
+
+    def pump_replay(self):
+        """Queue one saved event when the preceding output has drained."""
+        if self.is_closed or not self.ready or self.out_buff:
+            return
+        for _ in range(64):
+            if not self.replay_pending:
+                self.replay_store = None
+                return
+            uid = next(iter(self.replay_pending))
+            event = self.replay_store.get_event(uid)
+            if event is None or (self.user and uid == self.user.uid):
+                self.replay_pending.pop(uid)
+                continue
+            data = etree.tostring(event.as_element)
+            if len(data) > min(self.output_limit, self.output_budget.limit):
+                self.lgr.warning(
+                    "Skipping saved event %s: exceeds output byte limit", uid
+                )
+                self.replay_pending.pop(uid)
+                continue
+            if self.enqueue(data, position_key(event), event.time, replay=True):
+                self.replay_pending.pop(uid)
             return
 
-        self.out_buff.append(etree.tostring(event.as_element))
+    def close(self):
+        self.replay_pending.clear()
+        self.replay_store = None
+        TAKClient.close(self)

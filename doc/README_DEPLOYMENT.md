@@ -371,3 +371,42 @@ Building systemd services
  - Detected site install: /home/user/bluetack-1
  [ ... ]
 ```
+
+### Outgoing queue limits
+
+The `[cot_server]` section accepts these positive integer settings. Existing
+configuration files use the defaults when the settings are omitted:
+
+```ini
+output_client_bytes = 4194304
+output_total_bytes = 67108864
+output_stall_seconds = 60
+```
+
+These limits cover retained serialized payloads for TAK, monitor, and management
+connections: 4 MiB per connection and 64 MiB across the server. Partially sent
+messages count at their full backing size until completely sent. Queue metadata,
+a TLS retry buffer of at most 4096 bytes per connection, persistence, and parser
+memory are additional allocations.
+
+An ordinary participant position update replaces an entirely unsent update with
+the same UID and event type. The replacement is appended after intervening
+messages. Only recognized participant details qualify; directed messages, chats,
+alerts, drawings, commands, and unknown extensions keep their order. XML that has
+started transmission, including an outstanding TLS write, is never replaced.
+
+If replacement cannot keep a connection within its byte limit, that connection
+is closed. When the shared limit is exceeded, connections with the largest
+retained queues are closed until the new message fits. A connection with queued
+output is also closed after 60 seconds without a successful write. Incoming
+traffic and replacement updates do not extend this timeout.
+
+Saved events are replayed one at a time as output drains. Replay waits for shared
+space and skips individual saved events larger than either byte limit, recording
+a warning. It snapshots UIDs and reads their current unexpired values as needed;
+live updates remove matching UIDs from the remaining replay.
+
+Management status reports `output_retained_bytes` for the server and
+`output_pending_bytes`, `output_retained_bytes`, and `output_stalled_seconds` for
+each TAK connection, including anonymous connections with their IP and port.
+Disconnect logs include the reason and these queue measurements.

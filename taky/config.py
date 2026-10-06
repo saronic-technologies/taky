@@ -20,6 +20,9 @@ DEFAULT_CFG = {
         "mon_port": None,
         "log_cot": None,  # Path to log COT files to
         "max_persist_ttl": -1,  # Enforce a maximum persistence TTL
+        "output_client_bytes": 4 * 1024 * 1024,
+        "output_total_bytes": 64 * 1024 * 1024,
+        "output_stall_seconds": 60,
     },
     "dp_server": {
         "upload_path": "/var/taky/dp-user",
@@ -77,7 +80,7 @@ def load_config(path=None, explicit=False):
         ret_config.set("dp_server", "upload_path", "./dp-user")
 
     # Make directories absolute
-    for (sect, opt) in [
+    for sect, opt in [
         ("taky", "root_dir"),
         ("dp_server", "upload_path"),
         ("cot_server", "log_cot"),
@@ -109,6 +112,14 @@ def load_config(path=None, explicit=False):
         except (TypeError, ValueError) as exc:
             raise ValueError(f"Invalid max_persist_ttl: {max_ttl}") from exc
     ret_config.set("cot_server", "max_persist_ttl", str(max_ttl))
+
+    for option in ("output_client_bytes", "output_total_bytes", "output_stall_seconds"):
+        try:
+            value = ret_config.getint("cot_server", option)
+            if value is None or value <= 0:
+                raise ValueError()
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{option} must be a positive integer") from exc
 
     if not ret_config.getboolean("ssl", "enabled"):
         # Disable monitor port

@@ -18,14 +18,13 @@ class MgmtClient(SocketClient):
         self.buff = b""
         super().__init__(**kwargs)
 
-    @property
-    def has_data(self):
-        self.handle_rx()
-        return super().has_data
-
     def feed(self, data):
         self.buff += data
-        self.handle_rx()
+        while not self.is_closed and b"\0" in self.buff:
+            self.handle_rx()
+
+    def close(self):
+        self.buff = b""
 
     def handle_rx(self):
         try:
@@ -52,7 +51,7 @@ class MgmtClient(SocketClient):
             ret = {"error": str(exc)}
 
         ret = json.dumps(ret)
-        self.out_buff.append(ret.encode() + b"\0")
+        self.enqueue(ret.encode() + b"\0")
 
     def kickban(self, user):
         cdb = self.server.cert_db
@@ -83,6 +82,7 @@ class MgmtClient(SocketClient):
             "uptime": time.time() - self.server.started,
             "num_clients": 0,
             "clients": [],
+            "output_retained_bytes": self.server.output_budget.retained_bytes,
         }
         for client in self.server.clients.values():
             if not isinstance(client, TAKClient):
@@ -94,9 +94,17 @@ class MgmtClient(SocketClient):
                 "num_rx": client.num_rx,
                 "connected": client.connected,
             }
+            if isinstance(client, SocketClient):
+                cli_meta.update(
+                    {
+                        "ip": client.addr[0],
+                        "port": client.addr[1],
+                        "output_pending_bytes": len(client.out_buff),
+                        "output_retained_bytes": client.out_buff.retained_bytes,
+                        "output_stalled_seconds": client.output_stalled_seconds,
+                    }
+                )
             if client.user:
-                if isinstance(client, SocketClient):
-                    cli_meta["ip"] = client.addr[0]
                 cli_meta["uid"] = client.user.uid
                 cli_meta["callsign"] = client.user.callsign
                 cli_meta["group"] = str(client.user.group)

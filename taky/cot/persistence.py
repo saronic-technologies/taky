@@ -105,6 +105,10 @@ class BasePersistence:
         """
         raise NotImplementedError()
 
+    def get_uids(self):
+        """Return a snapshot of saved UIDs without retaining event objects."""
+        raise NotImplementedError()
+
     def get_event(self, uid):
         """
         Return a specific Event by UID. Returns None if the event does not
@@ -147,8 +151,15 @@ class Persistence(BasePersistence):
         return uid in self.events
 
     def get_event(self, uid):
+        event = self.events.get(uid)
+        if event is not None and dt.utcnow() > event.stale:
+            self.events.pop(uid)
+            return None
+        return event
+
+    def get_uids(self):
         self.prune()
-        return self.events.get("uid")
+        return list(self.events)
 
     def get_all(self):
         self.prune()
@@ -295,6 +306,19 @@ class RedisPersistence(BasePersistence):
             return None
 
         return evt
+
+    def get_uids(self):
+        try:
+            keys = self.rds.keys(f"{self.rds_ks}:*")
+            self._redis_result(True)
+            prefix_length = len(self.rds_ks) + 1
+            return [
+                (key.decode("utf8") if isinstance(key, bytes) else key)[prefix_length:]
+                for key in keys
+            ]
+        except redis.ConnectionError:
+            self._redis_result(False)
+            return []
 
     def get_all(self):
         try:

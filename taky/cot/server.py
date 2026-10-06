@@ -8,7 +8,7 @@ import logging
 from taky.config import app_config as config
 from taky.util import anc
 from .router import COTRouter
-from .client import TAKClient, SocketTAKClient
+from .client import TAKClient, SocketTAKClient, OutputBudget
 from .mgmt import MgmtClient
 
 
@@ -22,7 +22,7 @@ def build_srv(ip_addr, port):
             addr_info = socket.getaddrinfo(ip_addr, port, type=socket.SOCK_STREAM)
             if len(addr_info) > 1:
                 logging.warning("Multiple address entities for %s:%s", ip_addr, port)
-            (sock_fam, _, _, _, bind_args) = addr_info[0]
+            sock_fam, _, _, _, bind_args = addr_info[0]
         except socket.gaierror as exc:
             raise ValueError(
                 f"Unable to determine address info for bind_ip: {ip_addr}"
@@ -80,6 +80,9 @@ class COTServer:
         self.lgr = logging.getLogger(self.__class__.__name__)
 
         self.clients = {}
+        self.output_budget = OutputBudget(
+            config.getint("cot_server", "output_total_bytes")
+        )
         self.router = COTRouter()
         self.cert_db = anc.CertificateDatabase()
 
@@ -182,13 +185,16 @@ class COTServer:
             return
 
         try:
-            (sock, _) = self.mgmt.accept()
+            sock, _ = self.mgmt.accept()
         except (socket.error, OSError) as exc:
             self.lgr.info("Dropping management client: %s", exc)
             return
 
         self.lgr.info("New management client")
-        self.clients[sock] = MgmtClient(sock=sock, use_ssl=False, server=self)
+        sock.setblocking(False)
+        self.clients[sock] = MgmtClient(
+            sock=sock, use_ssl=False, server=self, output_budget=self.output_budget
+        )
 
     def srv_accept(self, srv_sock, force_tcp=False, mon_client=False):
         """
@@ -199,8 +205,8 @@ class COTServer:
         use_ssl = self.ssl_ctx and not (force_tcp or mon_client)
 
         try:
-            (sock, addr) = srv_sock.accept()
-            (ip_addr, port) = addr[0:2]
+            sock, addr = srv_sock.accept()
+            ip_addr, port = addr[0:2]
 
             if use_ssl and self.ssl_ctx:
                 sock = self.ssl_ctx.wrap_socket(
@@ -221,6 +227,7 @@ class COTServer:
             self.clients[sock] = SocketTAKClient(
                 monitor=True,
                 sock=sock,
+                output_budget=self.output_budget,
                 cbs={
                     "route": self.router.route,
                     "connect": self.client_connect,
@@ -231,6 +238,7 @@ class COTServer:
             self.clients[sock] = SocketTAKClient(
                 sock=sock,
                 use_ssl=use_ssl,
+                output_budget=self.output_budget,
                 cbs={
                     "route": self.router.route,
                     "packet_rx": self.mon_packet,
@@ -269,15 +277,25 @@ class COTServer:
         """
         Main loop. Call outside this object in a "while True" block.
         """
-        rd_clients = list(self.clients)
+        self.service_clients()
+        rd_clients = [
+            sock
+            for sock, client in self.clients.items()
+            if not client.is_closed and client.wants_read
+        ]
         rd_clients.append(self.srv)
         if self.mon:
             rd_clients.append(self.mon)
         if self.mgmt:
             rd_clients.append(self.mgmt)
-        wr_clients = list(filter(lambda x: self.clients[x].has_data, self.clients))
+        wr_clients = [
+            sock
+            for sock, client in self.clients.items()
+            if not client.is_closed and client.has_data
+        ]
+        ex_clients = list(set(rd_clients + wr_clients))
 
-        (s_rd, s_wr, s_ex) = select.select(rd_clients, wr_clients, rd_clients, 1)
+        s_rd, s_wr, s_ex = select.select(rd_clients, wr_clients, ex_clients, 1)
 
         # At each stage, we will need to re-check to make sure the previous
         # stage did not close our socket.
@@ -312,16 +330,17 @@ class COTServer:
         # Prune the persistence database
         self.router.prune()
 
-        # Prune sockets that have not finished the SSL handshake
+    def service_clients(self):
+        """Enforce timeouts even when a socket never becomes writable."""
         now = time.time()
-        prune_sox = list(self.clients.items())
-        for (sock, client) in prune_sox:
+        for client in list(self.clients.values()):
+            client.check_output_timeout()
             if client.is_closed:
                 self.client_disconnect(client, "Is closed")
-                continue
-
-            if not client.ready and (now - client.connected) > 10:
+            elif not client.ready and (now - client.connected) > 10:
                 self.client_disconnect(client, "SSL Handshake timeout")
+            elif isinstance(client, SocketTAKClient):
+                client.pump_replay()
 
     def shutdown(self):
         """
@@ -372,5 +391,5 @@ class COTServer:
 
     def mon_packet(self, evt):
         for client in self.clients.values():
-            if client.monitor:
+            if isinstance(client, TAKClient) and client.monitor:
                 client.send_event(evt)
