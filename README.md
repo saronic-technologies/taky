@@ -124,8 +124,7 @@ coalition forces!
 
 The COT server is the most mature part of the codebase. While some of the more
 esoteric configurations have not been tested, the standard SSL setup seems to
-be rather solid, and performs well with heavy loads. That being said, there is
-a known memory leak with the XML parser that hasn't been resolved.
+be rather solid, and performs well with heavy loads.
 
 The Data Package server (DPS) is starting to mature, but has not been as
 extensively tested. Simple client-to-client and client-to-server transfers seem
@@ -143,10 +142,8 @@ planned for the next version of taky! Pull requests and issues are welcome!
 
 ### Known Issues
 
-At this time, there is one known issue with taky: a memory leak caused by the
-XML parser library. Over several days, the memory usage in `taky` will balloon
-to excessive size, potentially causing instability. This issue will likely not
-be resolved unless LXML writes a fix for their parser.
+Memory can still grow with queued outgoing data, long-lived persisted events,
+and large or unfinished XML input.
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/tkuester/taky/main/doc/taky.png" alt="taky logo" width="200" />
