@@ -393,6 +393,8 @@ class TAKClient:
                 continue
             finally:
                 elm.clear(keep_tail=True)
+                while elm.getprevious() is not None:
+                    del elm.getparent()[0]
 
     def handle_atom(self, evt):
         """
