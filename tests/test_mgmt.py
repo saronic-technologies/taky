@@ -1,5 +1,5 @@
 import unittest as ut
-import mock
+from unittest import mock
 
 from taky.cot.mgmt import MgmtClient
 

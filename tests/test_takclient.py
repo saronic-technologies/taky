@@ -1,6 +1,6 @@
 import os
 import unittest as ut
-import mock
+from unittest import mock
 
 from lxml import etree
 
