@@ -9,6 +9,7 @@ import socket
 import ssl
 import logging
 import traceback
+from urllib.parse import quote
 
 from lxml import etree
 
@@ -381,19 +382,32 @@ class TAKClient:
         if not self.cot_fp:
             # Don't log if we don't have a user yet
             if self.user and self.user.uid:
-                name = os.path.join(
-                    self.log_cot_dir, f"{self.user.uid}-{self.user.callsign}.cot"
-                )
+                basename = f"{self.user.uid}-{self.user.callsign}.cot"
             elif hasattr(self, "addr"):
                 name = "monitor" if self.monitor else "anonymous"
-                name = os.path.join(self.log_cot_dir, f"{name}-{self.addr[0]}.cot")
+                basename = f"{name}-{self.addr[0]}.cot"
             else:
                 # Don't have a way to determine log file name!
                 return
 
             try:
+                # Preserve ordinary names while encoding untrusted path syntax.
+                # Anchor the append to the configured directory and refuse a
+                # pre-existing symlink, including when it points outside it.
+                basename = quote(basename, safe="-_.")
+                name = os.path.join(self.log_cot_dir, basename)
                 self.lgr.debug("Opening logfile %s", name)
-                self.cot_fp = open(name, "a+", encoding="utf8")
+                directory_fd = os.open(self.log_cot_dir, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    file_fd = os.open(
+                        basename,
+                        os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW,
+                        0o666,
+                        dir_fd=directory_fd,
+                    )
+                    self.cot_fp = os.fdopen(file_fd, "a+", encoding="utf8")
+                finally:
+                    os.close(directory_fd)
             except OSError as exc:
                 self.lgr.warning("Unable to open COT log: %s", exc)
                 self.cot_fp = None

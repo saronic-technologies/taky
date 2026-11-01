@@ -8,6 +8,15 @@ from werkzeug.utils import secure_filename
 from taky.dps import app, requires_auth
 
 
+def parse_video_xml(data):
+    """Parse video XML without loading DTDs or resolving external entities."""
+    parser = etree.XMLParser(resolve_entities=False, load_dtd=False, no_network=True)
+    elm = etree.fromstring(data, parser)
+    if elm.getroottree().docinfo.doctype:
+        raise ValueError("Document types are not supported")
+    return elm
+
+
 @app.route("/Marti/vcm", methods=["POST"])
 @requires_auth
 def marti_video_upload():
@@ -15,11 +24,9 @@ def marti_video_upload():
     Accepts an XML document of video feeds, and saves them
     to the video feed directory
     """
-    parser = etree.XMLParser(resolve_entities=True)
     try:
-        parser.feed(request.data)
-        elm = parser.close()
-    except etree.XMLSyntaxError:
+        elm = parse_video_xml(request.data)
+    except (etree.XMLSyntaxError, ValueError):
         return "Malformed XML", 400
 
     if elm.tag != "videoConnections":
@@ -65,8 +72,6 @@ def marti_video_index():
     if not os.path.exists(feeds_dir):
         return etree.tostring(doc, xml_declaration=True)
 
-    # Get ready to parse XML files
-    parser = etree.XMLParser(resolve_entities=True)
     for fname in os.listdir(feeds_dir):
         fname = os.path.join(feeds_dir, fname)
         if not os.path.isfile(fname):
@@ -77,16 +82,14 @@ def marti_video_index():
         # Read and parse the file
         try:
             with open(fname, "rb") as feed_fp:
-                xml = feed_fp.read()
-                parser.feed(xml)
-                elm = parser.close()
+                elm = parse_video_xml(feed_fp.read())
 
                 # Basic sanity check
                 if elm.tag != "feed":
                     continue
 
                 doc.append(elm)
-        except etree.XMLSyntaxError as exc:
+        except (etree.XMLSyntaxError, ValueError) as exc:
             print(exc)
             continue
         except OSError as exc:
