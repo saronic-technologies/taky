@@ -9,7 +9,7 @@ from unittest import mock
 from lxml import etree
 
 from taky.config import app_config, load_config
-from taky.cot import models
+from taky.cot import COTRouter, models
 from taky.cot.client import OutputBudget, SocketClient, SocketTAKClient
 from taky.cot.persistence import Persistence
 
@@ -443,6 +443,32 @@ class OutputLimitsTest(unittest.TestCase):
         events = self.transmitted_events(client)
         self.assertEqual([event.get("uid") for event in events], ["updated"])
         self.assertEqual(float(events[0].find("point").get("lat")), 2)
+        self.assertFalse(client.replay_pending)
+
+    def test_delete_skips_target_already_waiting_for_replay(self):
+        router = COTRouter()
+        router.persist.track_event(self.event(uid="removed"), 3600)
+        router.persist.track_event(self.event(uid="kept"), 3600)
+        client = self.client(tak=True)
+        router.client_connect(client)
+        client.enqueue(b"held")
+        client.start_replay(router.persist)
+        self.assertIn("removed", client.replay_pending)
+
+        deletion = self.event(
+            uid="delete-request", etype="t-x-d-d", extra='<link uid="removed"/>'
+        )
+        router.route(self.client(tak=True), deletion)
+        self.drain(client)
+        client.sock.transmitted.clear()
+
+        for _ in range(2):
+            client.pump_replay()
+            self.drain(client)
+
+        self.assertEqual(
+            [event.get("uid") for event in self.transmitted_events(client)], ["kept"]
+        )
         self.assertFalse(client.replay_pending)
 
     def test_live_event_prevents_older_replay_for_same_uid(self):

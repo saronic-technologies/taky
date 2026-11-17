@@ -4,11 +4,18 @@ import enum
 import logging
 from datetime import datetime as dt
 from datetime import timedelta
+from itertools import islice
 
 from taky.config import app_config
 from . import models
 from .client import TAKClient, SocketTAKClient
 from .persistence import build_persistence
+
+
+def _audit_identifier(value):
+    if value is None or len(value) <= 128:
+        return value
+    return value[:125] + "..."
 
 
 class Destination(enum.Enum):
@@ -131,6 +138,41 @@ class COTRouter:
         for client in self.find_clients(uid=dst_uid, callsign=dst_cs):
             client.send_event(msg)
 
+    def _log_delete_request(self, src, evt, uids):
+        if not self.lgr.isEnabledFor(logging.INFO):
+            return
+
+        user = src.user if src else None
+        detail = evt.detail
+        recipients = "broadcast=True"
+        if isinstance(detail, models.GeoChat):
+            if not detail.broadcast:
+                if detail.dst_team:
+                    recipients = "recipient_team=%r" % _audit_identifier(
+                        detail.dst_team.value
+                    )
+                else:
+                    recipients = "recipient_uids=%r" % [
+                        _audit_identifier(detail.dst_uid)
+                    ]
+        elif detail is not None and detail.has_marti:
+            callsigns = list(detail.marti_cs)
+            recipients = "recipient_callsign_count=%d recipient_callsigns=%r" % (
+                len(callsigns),
+                [_audit_identifier(callsign) for callsign in callsigns[:10]],
+            )
+        self.lgr.info(
+            "CoT delete request: uid=%r source_addr=%r source_uid=%r "
+            "source_callsign=%r target_count=%d target_uids=%r %s",
+            _audit_identifier(evt.uid),
+            getattr(src, "addr", None),
+            _audit_identifier(user.uid) if user else None,
+            _audit_identifier(user.callsign) if user else None,
+            len(uids),
+            [_audit_identifier(uid) for uid in islice(uids, 10)],
+            recipients,
+        )
+
     def route(self, src, evt):
         """
         Push an event to the router
@@ -142,6 +184,19 @@ class COTRouter:
         if self.max_ttl >= 0:
             if evt.persist_ttl > self.max_ttl:
                 evt.stale = dt.utcnow() + timedelta(seconds=self.max_ttl)
+
+        if evt.etype == "t-x-d-d":
+            uids = set()
+            detail = evt.detail.as_element if evt.detail is not None else None
+            if detail is not None:
+                uids = {
+                    link.get("uid")
+                    for link in detail.iterfind("link")
+                    if link.get("uid")
+                }
+            self._log_delete_request(src, evt, uids)
+            if uids:
+                self.persist.remove_events(uids)
 
         # Special handling for chat messages
         if isinstance(evt.detail, models.GeoChat):
