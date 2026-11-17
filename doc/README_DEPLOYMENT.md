@@ -406,6 +406,22 @@ space and skips individual saved events larger than either byte limit, recording
 a warning. It snapshots UIDs and reads their current unexpired values as needed;
 live updates remove matching UIDs from the remaining replay.
 
+An incoming `t-x-d-d` delete message removes saved events identified by the UIDs
+in its direct `detail/link` elements, with or without `__forcedelete`. This applies
+to both memory and Redis storage, including callsign-directed deletes. The
+message keeps its normal routing destinations and is not saved for replay.
+Missing targets are ignored, and a later update can save the same UID again.
+
+Each delete request produces an info-level log entry with the sender's connection
+address and reported UID/callsign when available, the event UID, target count,
+and intended recipients. Routing is described by `recipient_uids`,
+`recipient_callsigns`, `recipient_team`, or `broadcast=True`, following the same
+chat-before-Marti precedence as forwarding. Callsign lists include
+`recipient_callsign_count`. Target UIDs and callsigns are each limited to a
+sample of 10, and identifiers are limited to 128 characters in the log. The
+entry records a request, not successful removal or delivery; Redis deletion
+failures produce warnings. Logging does not change the message or its routing.
+
 Management status reports `output_retained_bytes` for the server and
 `output_pending_bytes`, `output_retained_bytes`, and `output_stalled_seconds` for
 each TAK connection, including anonymous connections with their IP and port.
