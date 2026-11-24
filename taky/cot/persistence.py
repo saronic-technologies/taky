@@ -99,6 +99,10 @@ class BasePersistence:
         """
         raise NotImplementedError()
 
+    def remove_events(self, uids):
+        """Remove saved events by UID, ignoring missing events."""
+        raise NotImplementedError()
+
     def get_all(self):
         """
         Return all items tracked
@@ -146,6 +150,10 @@ class Persistence(BasePersistence):
     def track_event(self, event, ttl):
         self.events[event.uid] = event
         self.prune()
+
+    def remove_events(self, uids):
+        for uid in uids:
+            self.events.pop(uid, None)
 
     def event_exists(self, uid):
         return uid in self.events
@@ -221,14 +229,11 @@ class RedisPersistence(BasePersistence):
             self._redis_result(False)
 
     def _redis_result(self, result):
-        """
-        Simple set/reset latch to notify the user if the connection to the
-        redis server is lost
-        """
+        """Report transitions between failed and successful Redis operations."""
         if self.rds_ok and not result:
-            self.lgr.warning("Lost connection to redis")
+            self.lgr.warning("Redis operation failed")
         elif not self.rds_ok and result:
-            self.lgr.warning("Connection to redis restored")
+            self.lgr.warning("Redis operation succeeded")
 
         self.rds_ok = result
 
@@ -240,6 +245,18 @@ class RedisPersistence(BasePersistence):
             self._redis_result(True)
         except redis.ConnectionError:
             self._redis_result(False)
+
+    def remove_events(self, uids):
+        keys = [f"{self.rds_ks}:{uid}" for uid in uids]
+        if not keys:
+            return
+
+        try:
+            self.rds.delete(*keys)
+            self._redis_result(True)
+        except redis.RedisError as exc:
+            self._redis_result(False)
+            self.lgr.warning("Unable to remove saved events from Redis: %s", exc)
 
     def event_exists(self, uid):
         return self._event_exists(uid)
